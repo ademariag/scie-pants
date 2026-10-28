@@ -1,0 +1,118 @@
+name: Private bootstrap ARM64 build
+
+on:
+  push:
+    branches:
+      - ademariag/private-bootstrap-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-bootstrap-arm-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PTEX_REVISION: a87179e4a5e5937e0999ed592fdfd151ea7f023c
+
+jobs:
+  build:
+    if: github.repository == 'ademariag/scie-pants'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Check out the combined private download providers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ademariag/ptex
+          ref: ${{ env.PTEX_REVISION }}
+          path: ptex-source
+          persist-credentials: false
+
+      - name: Test and build the pinned ARM64 ptex source
+        working-directory: ptex-source
+        run: |
+          cargo test --locked --release -p ptex
+          cargo build --locked --release --bin ptex
+
+      - name: Test and build the native ARM64 launcher
+        run: |
+          cargo test --locked --release --workspace
+          cargo build --locked --release --bin scie-pants
+
+      - name: Test private URL preflight delegation
+        run: |
+          python3 -m venv "$RUNNER_TEMP/test-venv"
+          "$RUNNER_TEMP/test-venv/bin/pip" install -r tools/requirements.txt -r tools/test-requirements.txt
+          PYTHONPATH=tools/src "$RUNNER_TEMP/test-venv/bin/python" -m pytest tools/tests/test_pants_version.py
+
+      - name: Package the launcher with the CI-built ARM64 ptex
+        env:
+          SCIENCE_AUTH_API_GITHUB_COM_BEARER: ${{ github.token }}
+        run: |
+          mirror_root="$RUNNER_TEMP/ptex-mirror"
+          release_dir="$mirror_root/download/v1.7.0"
+          mkdir -p "$release_dir"
+          install -m 755 ptex-source/target/release/ptex "$release_dir/ptex-linux-aarch64"
+          (cd "$release_dir" && sha256sum ptex-linux-aarch64 > ptex-linux-aarch64.sha256)
+          python3 -I -c '
+          from pathlib import Path
+          for name in ("pbt.toml", "scie-pants.toml"):
+              path = Path("package") / name
+              content = path.read_text()
+              section = "[lift.ptex]\n"
+              assert content.count(section) == 1 and "base_url" not in content
+              path.write_text(content.replace(section, section + "base_url = \"http://127.0.0.1:8123\"\n"))
+          '
+          python3 -I -m http.server 8123 --bind 127.0.0.1 --directory "$mirror_root" > "$RUNNER_TEMP/ptex-mirror.log" 2>&1 &
+          mirror_pid=$!
+          trap 'kill "$mirror_pid"' EXIT
+          curl --fail --silent --show-error --noproxy '*' --retry 5 --retry-connrefused --retry-delay 1 --max-time 10 \
+            http://127.0.0.1:8123/download/v1.7.0/ptex-linux-aarch64.sha256
+          cargo run --locked --release -p package -- scie --scie-pants "$PWD/target/release/scie-pants"
+
+      - name: Verify the embedded ARM64 downloader and record build metadata
+        run: |
+          extracted="$RUNNER_TEMP/scie-pants-parts"
+          mkdir -p "$extracted"
+          SCIE=split dist/scie-pants-linux-aarch64 "$extracted"
+          cmp ptex-source/target/release/ptex "$extracted/ptex-linux-aarch64"
+          SCIE=inspect dist/scie-pants-linux-aarch64 > dist/lift.json
+          (cd dist && sha256sum --check scie-pants-linux-aarch64.sha256)
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg commit "$GITHUB_SHA" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg ptex_commit "$(git -C ptex-source rev-parse HEAD)" \
+            --arg ptex_sha256 "$(sha256sum "$extracted/ptex-linux-aarch64" | cut -d ' ' -f 1)" \
+            '{repository: $repository, commit: $commit, run_url: $run_url,
+              target: "aarch64-unknown-linux-gnu", cargo_locked: true,
+              ptex: {repository: "ademariag/ptex", commit: $ptex_commit, sha256: $ptex_sha256,
+                providers: ["gcs", "github"]}}' > dist/build-info.json
+
+      - name: Upload ARM64 launcher, checksum, and build metadata
+        id: artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: scie-pants-private-linux-aarch64-gnu
+          path: |
+            dist/scie-pants-linux-aarch64
+            dist/scie-pants-linux-aarch64.sha256
+            dist/build-info.json
+            dist/lift.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Link the download
+        env:
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: printf '[Download ARM64 scie-pants](%s) (Linux aarch64/glibc; expires after 90 days).\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"
